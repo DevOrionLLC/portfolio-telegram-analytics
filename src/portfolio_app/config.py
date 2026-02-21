@@ -7,7 +7,10 @@ from pydantic import Field
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    TELEGRAM_BOT_TOKEN: str
+    # IMPORTANT:
+    # Worker must be able to start even if TELEGRAM_BOT_TOKEN is not set.
+    # Telegram bot / weekly sender will validate token at runtime.
+    TELEGRAM_BOT_TOKEN: str = Field(default="")
 
     BASE_DIR: str = "/opt/portfolio-telegram-analytics"
     VAR_DIR: str = "/opt/portfolio-telegram-analytics/var"
@@ -17,7 +20,9 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "sqlite:////opt/portfolio-telegram-analytics/var/app.sqlite3"
 
-    RISK_FREE_RATE_ANNUAL: float = 0.02
+    # Spec: 3% annual risk-free rate
+    RISK_FREE_RATE_ANNUAL: float = 0.03
+
     BENCHMARK_SP500: str = "SPY"
     BENCHMARK_R2000: str = "IWM"
     HISTORY_MONTHS: int = 3
