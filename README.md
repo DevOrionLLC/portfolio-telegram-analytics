@@ -1,5 +1,7 @@
 # Portfolio Telegram Analytics
 
+## Overview
+
 This project is a read-only portfolio analytics system that processes uploaded portfolio snapshots and generates descriptive performance reports. It retrieves recent market data using Yahoo Finance with a free Stooq fallback to ensure reliable coverage without paid API dependencies. The system computes key portfolio and benchmark metrics and delivers results with clear visual charts for easier interpretation. The design prioritizes stability, transparency, and ease of use.
 ---
 
