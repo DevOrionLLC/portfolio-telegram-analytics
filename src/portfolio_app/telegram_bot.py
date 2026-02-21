@@ -267,7 +267,8 @@ def format_result_message(result: dict[str, Any]) -> str:
     lines.append(f"- Variance share: {fmt(vs) if vs is not None else 'n/a'}")
     lines.append("")
 
-    lines.append("Rebalance (TSLA -25% shares, pro-rata to others):")
+    # ✅ updated text to match definition
+    lines.append("Rebalance (TSLA shares reduced by 25% of current share count; new_shares = old_shares * 0.75):")
     lines.append(f"- Return after: {fmt(after.get('return'))}")
     lines.append(f"- Vol after: {fmt(after.get('vol'))}")
     lines.append(f"- Max DD after: {fmt(after.get('max_drawdown'))}")

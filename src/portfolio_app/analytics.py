@@ -56,7 +56,6 @@ def _align_price_frames(price_frames: dict[str, pd.DataFrame], use_adj: bool = T
         if df is None or df.empty:
             continue
 
-        # ✅ FIX: fallback if adj_close missing
         if use_adj and "adj_close" in df.columns:
             s = df["adj_close"].rename(t)
         elif "close" in df.columns:
@@ -124,16 +123,23 @@ def tsla_concentration(prices: pd.DataFrame, holdings: dict[str, float]) -> dict
 
 def rebalance_tsla_static(holdings: dict[str, float], prices_last: pd.Series) -> tuple[dict[str, float], str | None]:
     """
-    Reduce TSLA shares by 25%, redistribute freed value pro-rata to others.
+    Definition of 25% reduction (IMPORTANT):
+      - Reduce the position size by 25% of its CURRENT SHARE COUNT.
+      - Example: if TSLA shares = 100, new TSLA shares = 75.
+      - This is share-count based (NOT dollar-value based).
+
+    Freed value from selling those shares is redistributed pro-rata to other holdings.
     """
     if "TSLA" not in holdings or "TSLA" not in prices_last.index:
         return holdings.copy(), "TSLA not present (or missing price data); rebalance skipped."
 
     new = holdings.copy()
+
     tsla_shares_old = float(new["TSLA"])
-    tsla_shares_new = tsla_shares_old * 0.75
-    freed_shares = tsla_shares_old - tsla_shares_new
-    freed_value = freed_shares * float(prices_last["TSLA"])
+    tsla_shares_new = tsla_shares_old * 0.75  # ✅ 25% reduction of current shares
+    sold_shares = tsla_shares_old - tsla_shares_new
+
+    sold_value = sold_shares * float(prices_last["TSLA"])
     new["TSLA"] = tsla_shares_new
 
     other = {t: q for t, q in new.items() if t != "TSLA" and t in prices_last.index}
@@ -147,7 +153,7 @@ def rebalance_tsla_static(holdings: dict[str, float], prices_last: pd.Series) ->
 
     for t in other:
         w = other_values[t] / total_other
-        add_value = freed_value * w
+        add_value = sold_value * w
         add_shares = add_value / float(prices_last[t])
         new[t] = float(new[t]) + float(add_shares)
 
@@ -208,7 +214,8 @@ def run_analysis(
         "benchmarks": bench_out,
         "tsla": tsla,
         "rebalance": {
-            "tsla_reduction": 0.25,
+            "reduction_definition": "Reduce TSLA position by 25% of its current share count (shares_new = shares_old * 0.75).",
+            "tsla_share_reduction_fraction": 0.25,
             "metrics_before": port_metrics,
             "metrics_after": reb_metrics,
         },

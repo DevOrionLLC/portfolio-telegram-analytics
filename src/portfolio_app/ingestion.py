@@ -6,15 +6,14 @@ import pandas as pd
 
 @dataclass
 class HoldingsParsed:
-    items: list[tuple[str, float]]  # (ticker, quantity)
+    items: list[tuple[str, float]]  # (ticker, quantity/shares)
     as_of_date: str | None          # YYYY-MM-DD
     warnings: list[str]
 
 
 def read_csv_bytes(data: bytes) -> pd.DataFrame:
     """
-    Keep this compatible with your existing codebase.
-    Robust read: tries utf-8 then latin-1.
+    Robust CSV reader from bytes.
     """
     try:
         return pd.read_csv(pd.io.common.BytesIO(data))
@@ -56,7 +55,7 @@ def parse_positions_snapshot(df: pd.DataFrame) -> HoldingsParsed:
       - price
       - market_value
 
-    Optional columns:
+    Optional columns (accepted if present):
       - cost_basis
       - sector
       - asset_class
@@ -65,7 +64,7 @@ def parse_positions_snapshot(df: pd.DataFrame) -> HoldingsParsed:
     Behavior:
       - Aggregates duplicate tickers (sum quantity, sum market_value).
       - Warns if MV differs from Q*P by >5% when price exists.
-      - Supports up to 50 holdings (warns if >50).
+      - Warns if holdings > 50.
     """
     warnings: list[str] = []
 
@@ -91,7 +90,7 @@ def parse_positions_snapshot(df: pd.DataFrame) -> HoldingsParsed:
 
     out = df.copy()
 
-    # parse as_of_date (choose most common non-null date)
+    # as_of_date: choose most common non-null date
     as_of_date: str | None = None
     try:
         dts = pd.to_datetime(out[c_asof], errors="coerce").dropna()
@@ -100,11 +99,11 @@ def parse_positions_snapshot(df: pd.DataFrame) -> HoldingsParsed:
     except Exception:
         warnings.append("Could not parse as_of_date values; continuing.")
 
-    # clean ticker
+    # ticker cleanup
     out["_ticker"] = out[c_tkr].astype(str).str.strip().str.upper()
     out = out[out["_ticker"].notna() & (out["_ticker"] != "")]
 
-    # numeric conversions
+    # numeric
     out["_qty"] = _to_num(out[c_qty])
     out["_px"] = _to_num(out[c_px])
     out["_mv"] = _to_num(out[c_mv])
@@ -118,17 +117,17 @@ def parse_positions_snapshot(df: pd.DataFrame) -> HoldingsParsed:
     if out.empty:
         return HoldingsParsed(items=[], as_of_date=as_of_date, warnings=warnings + ["No valid rows after cleaning."])
 
-    # aggregate by ticker (supports multiple accounts/rows)
+    # aggregate by ticker
     agg = out.groupby("_ticker", as_index=False).agg(
         quantity=("_qty", "sum"),
         market_value=("_mv", "sum"),
-        price=("_px", "last"),  # last non-null for sanity check only
+        price=("_px", "last"),  # for sanity check only
     )
 
     if len(agg) > 50:
         warnings.append(f"Holdings count is {len(agg)} (>50). Supported up to 50; results may be slow.")
 
-    # MV sanity check
+    # MV sanity check when possible
     for _, r in agg.iterrows():
         t = str(r["_ticker"])
         q = float(r["quantity"]) if pd.notna(r["quantity"]) else None
@@ -140,7 +139,10 @@ def parse_positions_snapshot(df: pd.DataFrame) -> HoldingsParsed:
         if abs(est) > 0:
             diff = abs(mv - est) / max(1.0, abs(est))
             if diff > 0.05:
-                warnings.append(f"{t}: market_value differs from quantity*price by ~{diff:.1%} (MV={mv:.2f}, Q*P={est:.2f}).")
+                warnings.append(
+                    f"{t}: market_value differs from quantity*price by ~{diff:.1%} "
+                    f"(MV={mv:.2f}, Q*P={est:.2f})."
+                )
 
     items = [(str(r["_ticker"]), float(r["quantity"])) for _, r in agg.iterrows() if pd.notna(r["quantity"])]
 
