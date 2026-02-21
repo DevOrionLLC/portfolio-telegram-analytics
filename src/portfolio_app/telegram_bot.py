@@ -24,6 +24,13 @@ from .ingestion import read_csv_bytes, parse_positions_snapshot
 log = logging.getLogger("bot")
 
 
+def _require_bot_token() -> str:
+    token = (settings.TELEGRAM_BOT_TOKEN or "").strip()
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set (telegram bot needs it).")
+    return token
+
+
 def _ensure_dirs() -> None:
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     Path(settings.REPORT_DIR).mkdir(parents=True, exist_ok=True)
@@ -249,7 +256,7 @@ def format_result_message(result: dict[str, Any]) -> str:
     lines.append(f"- Return: {fmt(p.get('return'))}")
     lines.append(f"- Vol (ann.): {fmt(p.get('vol'))}")
     lines.append(f"- Max DD: {fmt(p.get('max_drawdown'))}")
-    lines.append(f"- Sharpe (rf=2%): {fmtf(p.get('sharpe'))}")
+    lines.append(f"- Sharpe (rf=3%): {fmtf(p.get('sharpe'))}")
     lines.append("")
 
     lines.append("Benchmarks:")
@@ -267,7 +274,6 @@ def format_result_message(result: dict[str, Any]) -> str:
     lines.append(f"- Variance share: {fmt(vs) if vs is not None else 'n/a'}")
     lines.append("")
 
-    # ✅ updated text to match definition
     lines.append("Rebalance (TSLA shares reduced by 25% of current share count; new_shares = old_shares * 0.75):")
     lines.append(f"- Return after: {fmt(after.get('return'))}")
     lines.append(f"- Vol after: {fmt(after.get('vol'))}")
@@ -288,7 +294,7 @@ def main() -> None:
     setup_logging()
     _ensure_dirs()
 
-    app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(_require_bot_token()).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
