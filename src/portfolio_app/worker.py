@@ -50,7 +50,7 @@ def _render_plots(
     reb_holdings, _ = rebalance_tsla_static(holdings, px.iloc[-1])
     reb_rets = build_portfolio_returns(px, reb_holdings)
 
-    b_rets_map = {}
+    b_rets_map: dict[str, pd.Series] = {}
     for t, df in benchmarks.items():
         if df is None or df.empty:
             continue
@@ -80,6 +80,7 @@ def run_forever(poll_seconds: int = 2) -> None:
     Path(settings.CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
     log.info("Worker started. Polling for jobs…")
+    log.info("DATABASE_URL=%s", settings.DATABASE_URL)
 
     while True:
         job = None
@@ -115,26 +116,39 @@ def run_forever(poll_seconds: int = 2) -> None:
 def _run_job(job_id: int) -> None:
     with SessionLocal() as db:
         job = db.query(Job).filter(Job.id == job_id).one()
-        user = db.query(User).filter(User.id == job.user_id).one()
+        _ = db.query(User).filter(User.id == job.user_id).one()
         upload = db.query(Upload).filter(Upload.id == job.upload_id).one()
 
     data = _load_upload_bytes(upload)
     df = read_csv_bytes(data)
 
     parsed = parse_positions_snapshot(df)
-    holdings = dict(parsed.items)
+    holdings_all = dict(parsed.items)
+
+    # Per spec: benchmarks are compared separately, not held
+    bench_set = {settings.BENCHMARK_SP500, settings.BENCHMARK_R2000}
+    excluded = sorted([t for t in holdings_all.keys() if t in bench_set])
+    holdings = {t: q for t, q in holdings_all.items() if t not in bench_set}
+
+    extra_warns: list[str] = []
+    if excluded:
+        extra_warns.append(
+            f"Excluded benchmark tickers from holdings: {', '.join(excluded)} "
+            f"(benchmarks are compared separately)."
+        )
+
     tickers = list(holdings.keys())
 
     price_frames, warns_prices = fetch_many(tickers, settings.HISTORY_MONTHS)
     bench_frames, warns_bench = _benchmarks(settings.HISTORY_MONTHS)
 
-    result = run_analysis(parsed.items, price_frames, bench_frames)
+    result = run_analysis(list(holdings.items()), price_frames, bench_frames)
 
-    all_warns = parsed.warnings + warns_prices + warns_bench + result.warnings
+    all_warns = parsed.warnings + extra_warns + warns_prices + warns_bench + result.warnings
     result.result["warnings"] = all_warns
     if parsed.as_of_date:
         result.result["snapshot_as_of_date"] = parsed.as_of_date
-    result.result["holdings_count"] = len(parsed.items)
+    result.result["holdings_count"] = len(holdings)
 
     report_paths = _render_plots(job_id, holdings, price_frames, bench_frames)
 

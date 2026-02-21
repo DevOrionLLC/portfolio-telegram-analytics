@@ -19,9 +19,12 @@ from .analytics import _align_price_frames
 log = logging.getLogger("weekly")
 
 
-# ----------------------------
-# Formatting helpers
-# ----------------------------
+def _require_bot_token() -> str:
+    token = (settings.TELEGRAM_BOT_TOKEN or "").strip()
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set (weekly sender needs it).")
+    return token
+
 
 def _fmt_pct(x: float | None) -> str:
     if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
@@ -33,21 +36,6 @@ def _fmt_money(x: float | None) -> str:
     if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
         return "n/a"
     return f"${x:,.2f}"
-
-
-def _fmt_num(x: float | None) -> str:
-    if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
-        return "n/a"
-    return f"{x:,.2f}"
-
-
-# ----------------------------
-# Finance helpers
-# ----------------------------
-
-def _daily_rf(rf_annual: float) -> float:
-    # Annual -> daily (252 trading days)
-    return (1.0 + rf_annual) ** (1.0 / 252.0) - 1.0
 
 
 def _portfolio_value_series(px: pd.DataFrame, holdings: dict[str, float]) -> pd.Series:
@@ -70,29 +58,18 @@ def _period_return(values: pd.Series, lookback_trading_days: int) -> float | Non
     return (end / start) - 1.0
 
 
-def _annualized_vol(rets: pd.Series) -> float | None:
-    r = rets.dropna()
-    if len(r) < 2:
-        return None
-    return float(r.std(ddof=1) * np.sqrt(252.0))
+def _weights_at_last(px_last: pd.Series, holdings: dict[str, float]) -> dict[str, float]:
+    cols = [c for c in px_last.index if c in holdings]
+    if not cols:
+        return {}
+    vals = {t: float(px_last[t]) * float(holdings[t]) for t in cols}
+    total = float(sum(vals.values()))
+    if total <= 0:
+        return {}
+    return {t: v / total for t, v in vals.items()}
 
 
-def _sharpe_annual(rets: pd.Series) -> float | None:
-    r = rets.dropna()
-    if len(r) < 10:
-        return None
-    rf_d = _daily_rf(settings.RISK_FREE_RATE_ANNUAL)
-    excess = r - rf_d
-    denom = r.std(ddof=1)
-    if denom <= 1e-12:
-        return None
-    return float(excess.mean() / denom * np.sqrt(252.0))
-
-
-def _contribution_12m(px: pd.DataFrame, holdings: dict[str, float]) -> pd.Series:
-    """
-    Approx contribution over window = sum_t (w_{t-1} * r_t) by asset.
-    """
+def _weekly_contrib(px: pd.DataFrame, holdings: dict[str, float], lookback_days: int = 5) -> pd.Series:
     cols = [c for c in px.columns if c in holdings]
     if not cols:
         return pd.Series(dtype=float)
@@ -100,67 +77,41 @@ def _contribution_12m(px: pd.DataFrame, holdings: dict[str, float]) -> pd.Series
     shares = pd.Series({t: float(holdings[t]) for t in cols}, dtype=float)
     values = px[cols].mul(shares, axis=1)
     total = values.sum(axis=1)
-    if (total <= 0).all():
-        return pd.Series(dtype=float)
 
-    w = values.div(total, axis=0)
-    asset_rets = px[cols].pct_change()
-    contrib_daily = w.shift(1) * asset_rets
-    return contrib_daily.sum(axis=0).sort_values(ascending=False)
+    w = values.div(total, axis=0).replace([np.inf, -np.inf], np.nan)
+    r = px[cols].pct_change()
+
+    contrib_daily = w.shift(1) * r
+    contrib_tail = contrib_daily.tail(lookback_days)
+
+    return contrib_tail.sum(axis=0).dropna().sort_values(ascending=False)
 
 
-def _concentration_alerts(px_last: pd.Series, holdings: dict[str, float]) -> list[str]:
-    cols = [c for c in px_last.index if c in holdings]
-    if not cols:
-        return ["No concentration computed (missing prices)."]
-
-    values = {t: float(px_last[t]) * float(holdings[t]) for t in cols}
-    total = float(sum(values.values()))
-    if total <= 0:
-        return ["No concentration computed (zero total value)."]
-
-    weights = {t: v / total for t, v in values.items()}
-    top = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)
-
-    alerts: list[str] = []
-    top1_t, top1_w = top[0]
-    if top1_w >= 0.25:
-        alerts.append(f"Top holding {top1_t} is {_fmt_pct(top1_w)} of portfolio (≥ 25%).")
-
-    top3_w = sum(w for _, w in top[:3])
-    if top3_w >= 0.60:
-        alerts.append(f"Top 3 holdings are {_fmt_pct(top3_w)} of portfolio (≥ 60%).")
-
-    if "TSLA" in weights and weights["TSLA"] >= 0.20:
-        alerts.append(f"TSLA concentration is {_fmt_pct(weights['TSLA'])} (≥ 20%).")
-
-    if not alerts:
-        alerts.append("No major concentration alerts (top holding < 25%, top 3 < 60%).")
-
-    return alerts
+def _bench_return_1w(ticker: str, idx: pd.DatetimeIndex, lookback_days: int = 5) -> tuple[float | None, str | None]:
+    df, w = fetch_prices(ticker, settings.HISTORY_MONTHS)
+    if df is None or df.empty:
+        return None, w or f"{ticker}: no price data returned."
+    s = df["adj_close"] if "adj_close" in df.columns else df["close"]
+    s = s.reindex(idx).dropna()
+    if len(s) <= lookback_days:
+        return None, w or f"{ticker}: insufficient overlap for 1W return."
+    return _period_return(s, lookback_days), w
 
 
 @dataclass
-class ExecWeekly:
+class WeeklySummary:
     as_of_date: str | None
     total_value: float | None
-    r_1w: float | None
-    r_1m: float | None
-    r_3m: float | None
-    r_12m: float | None
-    vol_12m: float | None
-    sharpe_12m: float | None
-    top_contrib: tuple[str, float] | None
-    bottom_contrib: tuple[str, float] | None
-    conc_alerts: list[str]
-    bench_ticker: str
-    bench_r_12m: float | None
-    bench_vol_12m: float | None
-    bench_sharpe_12m: float | None
+    portfolio_r_1w: float | None
+    spy_r_1w: float | None
+    iwm_r_1w: float | None
+    tsla_weight: float | None
+    top_movers: list[tuple[str, float]]
+    bottom_movers: list[tuple[str, float]]
     notes: list[str]
 
 
-def _compute_exec_weekly(upload_path: str) -> ExecWeekly:
+def _compute_weekly(upload_path: str) -> WeeklySummary:
     notes: list[str] = []
 
     data = Path(upload_path).read_bytes()
@@ -168,20 +119,30 @@ def _compute_exec_weekly(upload_path: str) -> ExecWeekly:
     parsed = parse_positions_snapshot(df)
     notes.extend(parsed.warnings)
 
-    holdings = dict(parsed.items)
-    tickers = list(holdings.keys())
+    holdings_all = dict(parsed.items)
 
+    # Exclude benchmarks from holdings (benchmarks are compared separately)
+    bench_set = {settings.BENCHMARK_SP500, settings.BENCHMARK_R2000}
+    excluded = sorted([t for t in holdings_all.keys() if t in bench_set])
+    holdings = {t: q for t, q in holdings_all.items() if t not in bench_set}
+    if excluded:
+        notes.append(
+            f"Excluded benchmark tickers from holdings: {', '.join(excluded)} "
+            f"(benchmarks are compared separately)."
+        )
+
+    tickers = list(holdings.keys())
     if not tickers:
-        return ExecWeekly(
+        return WeeklySummary(
             as_of_date=parsed.as_of_date,
             total_value=None,
-            r_1w=None, r_1m=None, r_3m=None, r_12m=None,
-            vol_12m=None, sharpe_12m=None,
-            top_contrib=None, bottom_contrib=None,
-            conc_alerts=["No holdings found in snapshot."],
-            bench_ticker=settings.BENCHMARK_R2000,
-            bench_r_12m=None, bench_vol_12m=None, bench_sharpe_12m=None,
-            notes=notes + ["No holdings found in snapshot."],
+            portfolio_r_1w=None,
+            spy_r_1w=None,
+            iwm_r_1w=None,
+            tsla_weight=None,
+            top_movers=[],
+            bottom_movers=[],
+            notes=notes + ["No holdings found after filtering."],
         )
 
     price_frames, warn_prices = fetch_many(tickers, settings.HISTORY_MONTHS)
@@ -189,145 +150,101 @@ def _compute_exec_weekly(upload_path: str) -> ExecWeekly:
 
     px = _align_price_frames(price_frames, use_adj=True)
     if px.empty:
-        return ExecWeekly(
+        return WeeklySummary(
             as_of_date=parsed.as_of_date,
             total_value=None,
-            r_1w=None, r_1m=None, r_3m=None, r_12m=None,
-            vol_12m=None, sharpe_12m=None,
-            top_contrib=None, bottom_contrib=None,
-            conc_alerts=["No aligned price data across holdings (missing overlap)."],
-            bench_ticker=settings.BENCHMARK_R2000,
-            bench_r_12m=None, bench_vol_12m=None, bench_sharpe_12m=None,
+            portfolio_r_1w=None,
+            spy_r_1w=None,
+            iwm_r_1w=None,
+            tsla_weight=None,
+            top_movers=[],
+            bottom_movers=[],
             notes=notes + ["No aligned price data across holdings (missing overlap)."],
         )
 
     values = _portfolio_value_series(px, holdings)
     total_value = float(values.iloc[-1]) if not values.empty else None
 
-    # Trading-day approximations
-    r_1w = _period_return(values, 5)
-    r_1m = _period_return(values, 21)
-    r_3m = _period_return(values, 63)
-    r_12m = _period_return(values, 252)
+    portfolio_r_1w = _period_return(values, 5)
 
-    # 12M risk
-    values_12m = values.iloc[-252:] if len(values) > 252 else values
-    rets_12m = values_12m.pct_change().dropna()
-    vol_12m = _annualized_vol(rets_12m)
-    sharpe_12m = _sharpe_annual(rets_12m)
+    spy_r_1w, w1 = _bench_return_1w(settings.BENCHMARK_SP500, px.index, 5)
+    iwm_r_1w, w2 = _bench_return_1w(settings.BENCHMARK_R2000, px.index, 5)
+    if w1:
+        notes.append(w1)
+    if w2:
+        notes.append(w2)
 
-    # Attribution over 12M
-    px_12m = px.iloc[-252:] if len(px) > 252 else px
-    contrib = _contribution_12m(px_12m, holdings)
-    top_contrib = bottom_contrib = None
+    weights = _weights_at_last(px.iloc[-1], holdings)
+    tsla_weight = float(weights["TSLA"]) if "TSLA" in weights else None
+
+    contrib = _weekly_contrib(px, holdings, lookback_days=5)
+    top_movers: list[tuple[str, float]] = []
+    bottom_movers: list[tuple[str, float]] = []
     if not contrib.empty:
-        top_contrib = (str(contrib.index[0]), float(contrib.iloc[0]))
-        bottom_contrib = (str(contrib.index[-1]), float(contrib.iloc[-1]))
+        top = contrib.head(3)
+        bot = contrib.tail(3)
+        top_movers = [(str(i), float(v)) for i, v in top.items()]
+        bottom_movers = [(str(i), float(v)) for i, v in bot.items()]
 
-    conc_alerts = _concentration_alerts(px.iloc[-1], holdings)
-
-    # Benchmark: Russell 2000 proxy only (per requirement)
-    bench_ticker = settings.BENCHMARK_R2000
-    bench_r_12m = bench_vol_12m = bench_sharpe_12m = None
-    try:
-        bdf, bw = fetch_prices(bench_ticker, settings.HISTORY_MONTHS)
-        if bw:
-            notes.append(bw)
-        if bdf is not None and not bdf.empty:
-            bpx = bdf["adj_close"] if "adj_close" in bdf.columns else bdf["close"]
-            bpx = bpx.reindex(px.index).dropna()
-            if len(bpx) >= 10:
-                brets = bpx.pct_change().dropna()
-                brets_12m = brets.iloc[-252:] if len(brets) > 252 else brets
-                if not brets_12m.empty:
-                    bench_r_12m = float((1.0 + brets_12m).prod() - 1.0)
-                    bench_vol_12m = _annualized_vol(brets_12m)
-                    bench_sharpe_12m = _sharpe_annual(brets_12m)
-    except Exception as e:
-        notes.append(f"Benchmark fetch failed: {e}")
-
-    return ExecWeekly(
+    return WeeklySummary(
         as_of_date=parsed.as_of_date,
         total_value=total_value,
-        r_1w=r_1w, r_1m=r_1m, r_3m=r_3m, r_12m=r_12m,
-        vol_12m=vol_12m,
-        sharpe_12m=sharpe_12m,
-        top_contrib=top_contrib,
-        bottom_contrib=bottom_contrib,
-        conc_alerts=conc_alerts,
-        bench_ticker=bench_ticker,
-        bench_r_12m=bench_r_12m,
-        bench_vol_12m=bench_vol_12m,
-        bench_sharpe_12m=bench_sharpe_12m,
+        portfolio_r_1w=portfolio_r_1w,
+        spy_r_1w=spy_r_1w,
+        iwm_r_1w=iwm_r_1w,
+        tsla_weight=tsla_weight,
+        top_movers=top_movers,
+        bottom_movers=bottom_movers,
         notes=notes,
     )
 
 
-def _format_exec_message(s: ExecWeekly) -> str:
+def _format_weekly_message(s: WeeklySummary) -> str:
     lines: list[str] = []
-    lines.append("🧾 Weekly Executive Summary")
+    lines.append("📌 Weekly Portfolio Summary (last 5 trading days)")
     if s.as_of_date:
-        lines.append(f"As-of snapshot: {s.as_of_date}")
+        lines.append(f"Snapshot as-of: {s.as_of_date}")
     lines.append("")
 
     lines.append(f"Total portfolio value: {_fmt_money(s.total_value)}")
     lines.append("")
-
-    lines.append("Returns:")
-    lines.append(f"- 1W:  {_fmt_pct(s.r_1w)}")
-    lines.append(f"- 1M:  {_fmt_pct(s.r_1m)}")
-    lines.append(f"- 3M:  {_fmt_pct(s.r_3m)}")
-    lines.append(f"- 12M: {_fmt_pct(s.r_12m)}")
+    lines.append("Weekly returns:")
+    lines.append(f"- Portfolio: {_fmt_pct(s.portfolio_r_1w)}")
+    lines.append(f"- SPY:       {_fmt_pct(s.spy_r_1w)}")
+    lines.append(f"- IWM:       {_fmt_pct(s.iwm_r_1w)}")
     lines.append("")
 
-    lines.append("Risk (12M):")
-    lines.append(f"- Volatility (ann.): {_fmt_pct(s.vol_12m)}")
-    lines.append(f"- Sharpe ratio:      {_fmt_num(s.sharpe_12m)}")
+    lines.append("TSLA concentration:")
+    lines.append(f"- TSLA weight: {_fmt_pct(s.tsla_weight)}")
     lines.append("")
 
-    lines.append("Attribution (12M):")
-    if s.top_contrib:
-        lines.append(f"- Largest contributor: {s.top_contrib[0]} ({_fmt_pct(s.top_contrib[1])})")
+    lines.append("Biggest movers (by contribution, last 5 trading days):")
+    if s.top_movers:
+        for t, v in s.top_movers:
+            lines.append(f"- ↑ {t}: {_fmt_pct(v)}")
     else:
-        lines.append("- Largest contributor: n/a")
-    if s.bottom_contrib:
-        lines.append(f"- Largest detractor:   {s.bottom_contrib[0]} ({_fmt_pct(s.bottom_contrib[1])})")
-    else:
-        lines.append("- Largest detractor:   n/a")
-    lines.append("")
+        lines.append("- n/a")
 
-    lines.append("Concentration alerts:")
-    for a in s.conc_alerts[:5]:
-        lines.append(f"- {a}")
-    lines.append("")
+    if s.bottom_movers:
+        for t, v in s.bottom_movers:
+            lines.append(f"- ↓ {t}: {_fmt_pct(v)}")
 
-    lines.append(f"Benchmark comparison (Russell 2000 proxy: {s.bench_ticker}):")
-    lines.append(f"- 12M Return: {_fmt_pct(s.bench_r_12m)}")
-    lines.append(f"- 12M Vol (ann.): {_fmt_pct(s.bench_vol_12m)}")
-    lines.append(f"- 12M Sharpe: {_fmt_num(s.bench_sharpe_12m)}")
-
-    # Keep notes short
-    if s.notes:
-        brief = [x for x in s.notes if x][:5]
-        if brief:
-            lines.append("")
-            lines.append("Notes:")
-            for n in brief:
-                lines.append(f"- {n}")
+    brief = [x for x in s.notes if x][:5]
+    if brief:
+        lines.append("")
+        lines.append("Notes:")
+        for n in brief:
+            lines.append(f"- {n}")
 
     return "\n".join(lines)
 
 
-# ----------------------------
-# Runner (called by systemd timer)
-# ----------------------------
-
 async def main() -> None:
     setup_logging()
-    bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+    bot = Bot(token=_require_bot_token())
 
     with SessionLocal() as db:
-        users = db.query(User).filter(User.weekly_enabled == True).all()  # noqa: E712
+        users = db.query(User).filter(User.weekly_enabled == True).all()
 
     if not users:
         log.info("No users with weekly_enabled=1. Nothing to send.")
@@ -353,9 +270,8 @@ async def _send_user_weekly(bot: Bot, user: User) -> None:
         log.info("Skip weekly for chat_id=%s: no uploads.", user.telegram_chat_id)
         return
 
-    # Compute + send
-    summary = _compute_exec_weekly(last_upload.stored_path)
-    msg = _format_exec_message(summary)
+    summary = _compute_weekly(last_upload.stored_path)
+    msg = _format_weekly_message(summary)
 
     await bot.send_message(chat_id=int(user.telegram_chat_id), text=msg)
     log.info("Weekly summary sent to chat_id=%s (upload_id=%s)", user.telegram_chat_id, last_upload.id)
