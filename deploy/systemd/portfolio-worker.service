@@ -6,13 +6,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-Group=root
 WorkingDirectory=/opt/portfolio-telegram-analytics
 EnvironmentFile=/opt/portfolio-telegram-analytics/.env
-ExecStart=/opt/portfolio-telegram-analytics/scripts/run_worker.sh
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
+
+ExecStart=/usr/bin/flock -n /var/lock/portfolio-worker.lock /opt/portfolio-telegram-analytics/.venv/bin/python -m portfolio_app.worker
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target

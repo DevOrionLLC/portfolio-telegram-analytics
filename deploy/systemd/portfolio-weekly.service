@@ -9,5 +9,6 @@ User=root
 Group=root
 WorkingDirectory=/opt/portfolio-telegram-analytics
 EnvironmentFile=/opt/portfolio-telegram-analytics/.env
-ExecStart=/opt/portfolio-telegram-analytics/scripts/run_weekly.sh
+ExecStart=/usr/bin/flock -n /var/lock/portfolio-weekly.lock /opt/portfolio-telegram-analytics/.venv/bin/python -m portfolio_app.weekly
+
 NoNewPrivileges=true

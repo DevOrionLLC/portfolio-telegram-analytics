@@ -11,7 +11,7 @@ import pandas as pd
 from .logging_setup import setup_logging
 from .db import SessionLocal
 from .models import Job, User, Upload
-from .ingestion import read_csv_bytes, parse_holdings
+from .ingestion import read_csv_bytes, parse_positions_snapshot
 from .market_data import fetch_many, fetch_prices
 from .analytics import run_analysis, build_portfolio_returns, rebalance_tsla_static, _align_price_frames
 from .plots import plot_cumulative, plot_drawdown
@@ -24,56 +24,9 @@ def _load_upload_bytes(upload: Upload) -> bytes:
     return Path(upload.stored_path).read_bytes()
 
 
-def _norm(s: str) -> str:
-    return "".join(ch.lower() for ch in str(s).strip())
-
-
-def _infer_ticker_and_qty_columns(df: pd.DataFrame) -> tuple[str | None, str | None]:
-    cols = [str(c) for c in df.columns]
-    if not cols:
-        return None, None
-
-    cols_norm = {_norm(c): c for c in cols}
-
-    ticker_keys_priority = ["symbol", "ticker", "security", "instrument", "asset_symbol", "assetname", "asset_name"]
-    qty_keys_priority = ["quantity", "qty", "shares", "units", "position", "amount"]
-
-    ticker_col = None
-    for key in ticker_keys_priority:
-        for cnorm, corig in cols_norm.items():
-            if cnorm == key or cnorm.replace(" ", "") == key:
-                ticker_col = corig
-                break
-        if ticker_col:
-            break
-    if not ticker_col:
-        for c in cols:
-            cn = _norm(c)
-            if "ticker" in cn or "symbol" in cn or cn.startswith("sym"):
-                ticker_col = c
-                break
-
-    qty_col = None
-    for key in qty_keys_priority:
-        for cnorm, corig in cols_norm.items():
-            if cnorm == key or cnorm.replace(" ", "") == key:
-                qty_col = corig
-                break
-        if qty_col:
-            break
-    if not qty_col:
-        for c in cols:
-            cn = _norm(c)
-            if "qty" in cn or "quant" in cn or "share" in cn or "unit" in cn:
-                qty_col = c
-                break
-
-    return ticker_col, qty_col
-
-
 def _benchmarks(months: int) -> tuple[dict[str, pd.DataFrame], list[str]]:
-    out = {}
-    warns = []
+    out: dict[str, pd.DataFrame] = {}
+    warns: list[str] = []
     for t in (settings.BENCHMARK_SP500, settings.BENCHMARK_R2000):
         df, w = fetch_prices(t, months)
         if w:
@@ -83,7 +36,12 @@ def _benchmarks(months: int) -> tuple[dict[str, pd.DataFrame], list[str]]:
     return out, warns
 
 
-def _render_plots(job_id: int, holdings: dict[str, float], price_frames: dict[str, pd.DataFrame], benchmarks: dict[str, pd.DataFrame]) -> list[str]:
+def _render_plots(
+    job_id: int,
+    holdings: dict[str, float],
+    price_frames: dict[str, pd.DataFrame],
+    benchmarks: dict[str, pd.DataFrame],
+) -> list[str]:
     px = _align_price_frames(price_frames, use_adj=True)
     if px.empty:
         return []
@@ -94,6 +52,8 @@ def _render_plots(job_id: int, holdings: dict[str, float], price_frames: dict[st
 
     b_rets_map = {}
     for t, df in benchmarks.items():
+        if df is None or df.empty:
+            continue
         s = df["adj_close"] if "adj_close" in df.columns else df["close"]
         s = s.reindex(px.index).dropna()
         b_rets_map[t] = s.pct_change()
@@ -161,34 +121,20 @@ def _run_job(job_id: int) -> None:
     data = _load_upload_bytes(upload)
     df = read_csv_bytes(data)
 
-    # ✅ Auto-fallback mapping if missing
-    if not user.ticker_col or not user.qty_col:
-        ticker_col, qty_col = _infer_ticker_and_qty_columns(df)
-        if not ticker_col or not qty_col:
-            raise RuntimeError(
-                "Could not auto-detect ticker/quantity columns from CSV headers. "
-                "Rename headers to include 'symbol' (or 'ticker') and 'quantity' (or 'shares') and upload again."
-            )
-        with SessionLocal() as db:
-            u = db.query(User).filter(User.id == user.id).one()
-            u.ticker_col = ticker_col
-            u.qty_col = qty_col
-            db.commit()
-        # refresh local copy
-        user.ticker_col = ticker_col
-        user.qty_col = qty_col
-
-    holdings_parsed = parse_holdings(df, user.ticker_col, user.qty_col)
-    holdings = dict(holdings_parsed.items)
+    parsed = parse_positions_snapshot(df)
+    holdings = dict(parsed.items)
     tickers = list(holdings.keys())
 
     price_frames, warns_prices = fetch_many(tickers, settings.HISTORY_MONTHS)
     bench_frames, warns_bench = _benchmarks(settings.HISTORY_MONTHS)
 
-    result = run_analysis(holdings_parsed.items, price_frames, bench_frames)
+    result = run_analysis(parsed.items, price_frames, bench_frames)
 
-    all_warns = holdings_parsed.warnings + warns_prices + warns_bench + result.warnings
+    all_warns = parsed.warnings + warns_prices + warns_bench + result.warnings
     result.result["warnings"] = all_warns
+    if parsed.as_of_date:
+        result.result["snapshot_as_of_date"] = parsed.as_of_date
+    result.result["holdings_count"] = len(parsed.items)
 
     report_paths = _render_plots(job_id, holdings, price_frames, bench_frames)
 

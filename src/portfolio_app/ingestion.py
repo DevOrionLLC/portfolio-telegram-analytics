@@ -1,80 +1,147 @@
 from __future__ import annotations
 
-import csv
-import io
-import logging
 from dataclasses import dataclass
-from typing import Iterable
-
 import pandas as pd
 
-log = logging.getLogger("ingestion")
 
-
-@dataclass(frozen=True)
-class Holdings:
-    # list of (ticker, quantity)
-    items: list[tuple[str, float]]
+@dataclass
+class HoldingsParsed:
+    items: list[tuple[str, float]]  # (ticker, quantity)
+    as_of_date: str | None          # YYYY-MM-DD
     warnings: list[str]
 
 
-def normalize_ticker(x: str) -> str:
-    x = (x or "").strip().upper()
-    x = x.replace("\ufeff", "")  # BOM
-    # very light normalization; extend as needed
-    return x
-
-
-def detect_columns(df: pd.DataFrame) -> dict[str, list[str]]:
-    cols = [c for c in df.columns]
-    lc = {c: c.lower().strip() for c in cols}
-
-    ticker_candidates = [c for c in cols if any(k in lc[c] for k in ["ticker", "symbol", "security", "instrument"])]
-    qty_candidates = [c for c in cols if any(k in lc[c] for k in ["qty", "quantity", "shares", "units", "position"])]
-
-    return {"ticker": ticker_candidates, "qty": qty_candidates, "all": cols}
-
-
 def read_csv_bytes(data: bytes) -> pd.DataFrame:
-    # robust-ish: try utf-8 then latin-1
-    for enc in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            return pd.read_csv(io.BytesIO(data), encoding=enc)
-        except Exception:
-            continue
-    # last resort: let pandas guess
-    return pd.read_csv(io.BytesIO(data))
+    """
+    Keep this compatible with your existing codebase.
+    Robust read: tries utf-8 then latin-1.
+    """
+    try:
+        return pd.read_csv(pd.io.common.BytesIO(data))
+    except Exception:
+        return pd.read_csv(pd.io.common.BytesIO(data), encoding="latin-1")
 
 
-def parse_holdings(df: pd.DataFrame, ticker_col: str, qty_col: str) -> Holdings:
+def _norm_col(c: str) -> str:
+    return (
+        str(c)
+        .strip()
+        .lower()
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("_", "")
+    )
+
+
+def _find_col(df: pd.DataFrame, wanted: str, aliases: list[str]) -> str | None:
+    want_norms = {_norm_col(wanted)} | {_norm_col(a) for a in aliases}
+    for c in df.columns:
+        if _norm_col(c) in want_norms:
+            return str(c)
+    return None
+
+
+def _to_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s.astype(str).str.replace(",", ""), errors="coerce")
+
+
+def parse_positions_snapshot(df: pd.DataFrame) -> HoldingsParsed:
+    """
+    Parse a positions snapshot CSV.
+
+    Required columns:
+      - as_of_date
+      - ticker
+      - quantity
+      - price
+      - market_value
+
+    Optional columns:
+      - cost_basis
+      - sector
+      - asset_class
+      - account_name
+
+    Behavior:
+      - Aggregates duplicate tickers (sum quantity, sum market_value).
+      - Warns if MV differs from Q*P by >5% when price exists.
+      - Supports up to 50 holdings (warns if >50).
+    """
     warnings: list[str] = []
-    if ticker_col not in df.columns or qty_col not in df.columns:
-        return Holdings(items=[], warnings=[f"Missing required columns: {ticker_col} / {qty_col}"])
 
-    sub = df[[ticker_col, qty_col]].copy()
-    sub.columns = ["ticker", "qty"]
+    c_asof = _find_col(df, "as_of_date", aliases=["asofdate", "asof", "date", "snapshot_date"])
+    c_tkr = _find_col(df, "ticker", aliases=["symbol", "security", "instrument"])
+    c_qty = _find_col(df, "quantity", aliases=["qty", "shares", "units", "position"])
+    c_px = _find_col(df, "price", aliases=["last_price", "unit_price", "close"])
+    c_mv = _find_col(df, "market_value", aliases=["marketvalue", "mv", "value", "position_value"])
 
-    items: list[tuple[str, float]] = []
-    for i, row in sub.iterrows():
-        t = normalize_ticker(str(row["ticker"]))
-        if not t or t.lower() == "nan":
+    missing = [name for name, col in [
+        ("as_of_date", c_asof),
+        ("ticker", c_tkr),
+        ("quantity", c_qty),
+        ("price", c_px),
+        ("market_value", c_mv),
+    ] if col is None]
+
+    if missing:
+        raise ValueError(
+            "Missing required columns: " + ", ".join(missing) +
+            ". Required: as_of_date, ticker, quantity, price, market_value"
+        )
+
+    out = df.copy()
+
+    # parse as_of_date (choose most common non-null date)
+    as_of_date: str | None = None
+    try:
+        dts = pd.to_datetime(out[c_asof], errors="coerce").dropna()
+        if not dts.empty:
+            as_of_date = str(dts.dt.date.mode().iloc[0])
+    except Exception:
+        warnings.append("Could not parse as_of_date values; continuing.")
+
+    # clean ticker
+    out["_ticker"] = out[c_tkr].astype(str).str.strip().str.upper()
+    out = out[out["_ticker"].notna() & (out["_ticker"] != "")]
+
+    # numeric conversions
+    out["_qty"] = _to_num(out[c_qty])
+    out["_px"] = _to_num(out[c_px])
+    out["_mv"] = _to_num(out[c_mv])
+
+    before = len(out)
+    out = out[out["_qty"].notna()]
+    dropped = before - len(out)
+    if dropped:
+        warnings.append(f"Dropped {dropped} rows missing quantity.")
+
+    if out.empty:
+        return HoldingsParsed(items=[], as_of_date=as_of_date, warnings=warnings + ["No valid rows after cleaning."])
+
+    # aggregate by ticker (supports multiple accounts/rows)
+    agg = out.groupby("_ticker", as_index=False).agg(
+        quantity=("_qty", "sum"),
+        market_value=("_mv", "sum"),
+        price=("_px", "last"),  # last non-null for sanity check only
+    )
+
+    if len(agg) > 50:
+        warnings.append(f"Holdings count is {len(agg)} (>50). Supported up to 50; results may be slow.")
+
+    # MV sanity check
+    for _, r in agg.iterrows():
+        t = str(r["_ticker"])
+        q = float(r["quantity"]) if pd.notna(r["quantity"]) else None
+        p = float(r["price"]) if pd.notna(r["price"]) else None
+        mv = float(r["market_value"]) if pd.notna(r["market_value"]) else None
+        if q is None or p is None or mv is None:
             continue
-        try:
-            q = float(row["qty"])
-        except Exception:
-            warnings.append(f"Row {i}: could not parse quantity for {t}; skipped.")
-            continue
-        if q == 0:
-            continue
-        items.append((t, q))
+        est = q * p
+        if abs(est) > 0:
+            diff = abs(mv - est) / max(1.0, abs(est))
+            if diff > 0.05:
+                warnings.append(f"{t}: market_value differs from quantity*price by ~{diff:.1%} (MV={mv:.2f}, Q*P={est:.2f}).")
 
-    if not items:
-        warnings.append("No holdings parsed (after cleaning).")
+    items = [(str(r["_ticker"]), float(r["quantity"])) for _, r in agg.iterrows() if pd.notna(r["quantity"])]
 
-    # aggregate duplicates
-    agg: dict[str, float] = {}
-    for t, q in items:
-        agg[t] = agg.get(t, 0.0) + q
-
-    final = sorted(agg.items(), key=lambda x: x[0])
-    return Holdings(items=final, warnings=warnings)
+    return HoldingsParsed(items=items, as_of_date=as_of_date, warnings=warnings)

@@ -46,18 +46,25 @@ def _metrics(returns: pd.Series) -> dict:
 
 
 def _align_price_frames(price_frames: dict[str, pd.DataFrame], use_adj: bool = True) -> pd.DataFrame:
-    # ✅ FIX: fallback to 'close' if 'adj_close' missing
+    """
+    Align prices across assets by date.
+    Uses adj_close when present, otherwise close.
+    Uses intersection of dates to avoid forward-fill bias.
+    """
     px = []
     for t, df in price_frames.items():
         if df is None or df.empty:
             continue
+
+        # ✅ FIX: fallback if adj_close missing
         if use_adj and "adj_close" in df.columns:
             s = df["adj_close"].rename(t)
         elif "close" in df.columns:
             s = df["close"].rename(t)
         else:
-            log.warning("No price column for %s. Columns=%s", t, list(df.columns))
+            log.warning("No usable price column for %s. Columns=%s", t, list(df.columns))
             continue
+
         px.append(s)
 
     if not px:
@@ -77,8 +84,7 @@ def build_portfolio_returns(prices: pd.DataFrame, holdings: dict[str, float]) ->
     shares = pd.Series({t: holdings[t] for t in cols}, dtype=float)
     values = prices.mul(shares, axis=1)
     total = values.sum(axis=1)
-    rets = total.pct_change().dropna()
-    return rets
+    return total.pct_change().dropna()
 
 
 def contribution_by_asset(prices: pd.DataFrame, holdings: dict[str, float]) -> pd.Series:
@@ -117,6 +123,9 @@ def tsla_concentration(prices: pd.DataFrame, holdings: dict[str, float]) -> dict
 
 
 def rebalance_tsla_static(holdings: dict[str, float], prices_last: pd.Series) -> tuple[dict[str, float], str | None]:
+    """
+    Reduce TSLA shares by 25%, redistribute freed value pro-rata to others.
+    """
     if "TSLA" not in holdings or "TSLA" not in prices_last.index:
         return holdings.copy(), "TSLA not present (or missing price data); rebalance skipped."
 
@@ -165,6 +174,8 @@ def run_analysis(
 
     bench_out = {}
     for name, df in benchmarks.items():
+        if df is None or df.empty:
+            continue
         bpx = df["adj_close"] if "adj_close" in df.columns else df["close"]
         bpx = bpx.reindex(px.index).dropna()
         brets = bpx.pct_change().dropna()
@@ -188,11 +199,19 @@ def run_analysis(
         top_pos, top_neg = {}, {}
 
     result = {
-        "window": {"start": str(px.index.min().date()), "end": str(px.index.max().date()), "days": int(len(px.index))},
+        "window": {
+            "start": str(px.index.min().date()),
+            "end": str(px.index.max().date()),
+            "days": int(len(px.index)),
+        },
         "portfolio": {"metrics": port_metrics},
         "benchmarks": bench_out,
         "tsla": tsla,
-        "rebalance": {"tsla_reduction": 0.25, "metrics_before": port_metrics, "metrics_after": reb_metrics},
+        "rebalance": {
+            "tsla_reduction": 0.25,
+            "metrics_before": port_metrics,
+            "metrics_after": reb_metrics,
+        },
         "contributors": {"top_positive": top_pos, "top_negative": top_neg},
         "warnings": warnings,
     }

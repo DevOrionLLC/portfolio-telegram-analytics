@@ -5,7 +5,6 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 from telegram import Update, Document
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -20,8 +19,7 @@ from .config import settings
 from .logging_setup import setup_logging
 from .db import SessionLocal
 from .models import User, Upload, Job
-from .ingestion import read_csv_bytes  # keep your existing reader
-# from .openclaw_hooks import post_wake
+from .ingestion import read_csv_bytes, parse_positions_snapshot
 
 log = logging.getLogger("bot")
 
@@ -54,114 +52,14 @@ def _is_csv(doc: Document) -> bool:
     return name.endswith(".csv")
 
 
-def _norm(s: str) -> str:
-    return "".join(ch.lower() for ch in str(s).strip())
-
-
-def _infer_ticker_and_qty_columns(df: pd.DataFrame) -> tuple[str | None, str | None, list[str]]:
-    """
-    Auto-detect ticker and quantity columns from df.columns.
-    Returns (ticker_col, qty_col, warnings)
-    """
-    warns: list[str] = []
-    cols = [str(c) for c in df.columns]
-    if not cols:
-        return None, None, ["CSV has no columns."]
-
-    cols_norm = {_norm(c): c for c in cols}
-
-    # --- Ticker candidates (common names)
-    ticker_keys_priority = [
-        "symbol", "ticker", "tickersymbol",
-        "security", "securityid", "instrument", "instrumentid",
-        "asset", "asset_symbol", "assetname", "asset_name",
-        "isin", "cusip",
-    ]
-
-    ticker_col: str | None = None
-    for key in ticker_keys_priority:
-        for cnorm, corig in cols_norm.items():
-            if cnorm == key or cnorm.replace(" ", "") == key:
-                ticker_col = corig
-                break
-        if ticker_col:
-            break
-
-    # If not found, try partial matches like "sym", "tick"
-    if not ticker_col:
-        for c in cols:
-            cn = _norm(c)
-            if "ticker" in cn or cn == "sym" or cn.startswith("symb") or "symbol" in cn:
-                ticker_col = c
-                break
-
-    # --- Quantity candidates (shares / quantity)
-    qty_keys_priority = [
-        "quantity", "qty", "shares", "share", "units", "unit",
-        "position", "positionqty", "position_qty",
-        "holdings", "holding", "amount",
-    ]
-
-    qty_col: str | None = None
-    for key in qty_keys_priority:
-        for cnorm, corig in cols_norm.items():
-            if cnorm == key or cnorm.replace(" ", "") == key:
-                qty_col = corig
-                break
-        if qty_col:
-            break
-
-    # If not found, try partial matches
-    if not qty_col:
-        for c in cols:
-            cn = _norm(c)
-            if "qty" in cn or "quant" in cn or "share" in cn or "unit" in cn:
-                qty_col = c
-                break
-
-    # Validate quickly by sampling values
-    if ticker_col:
-        # must look like symbols: mostly non-numeric strings, not too long
-        s = df[ticker_col].dropna().astype(str).head(25)
-        if s.empty:
-            warns.append(f"Ticker column '{ticker_col}' has no values.")
-        else:
-            # if many are numeric, it's probably wrong
-            numeric_like = sum(x.replace(".", "", 1).isdigit() for x in s.tolist())
-            if numeric_like >= max(1, len(s) // 2):
-                warns.append(f"Ticker column guess '{ticker_col}' looks numeric; may be wrong.")
-
-    if qty_col:
-        s = df[qty_col].dropna().head(25)
-        if s.empty:
-            warns.append(f"Quantity column '{qty_col}' has no values.")
-        else:
-            # check if convertible to number
-            ok = 0
-            for x in s.tolist():
-                try:
-                    float(str(x).replace(",", ""))
-                    ok += 1
-                except Exception:
-                    pass
-            if ok < max(1, len(s) // 2):
-                warns.append(f"Quantity column guess '{qty_col}' is not mostly numeric; may be wrong.")
-
-    if not ticker_col:
-        warns.append("Could not auto-detect ticker column (expected names like symbol/ticker).")
-    if not qty_col:
-        warns.append("Could not auto-detect quantity column (expected names like qty/shares/quantity).")
-
-    return ticker_col, qty_col, warns
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = str(update.effective_chat.id)
     _get_or_create_user(chat_id)
     await update.message.reply_text(
-        "Hi! Send /upload then attach your CSV portfolio statement.\n"
-        "Commands: /upload /run /report /weekly on|off /help\n\n"
-        "✅ Column mapping is automatic (no buttons)."
+        "Hi! Send /upload then attach your positions snapshot CSV.\n\n"
+        "Required columns:\n"
+        "- as_of_date, ticker, quantity, price, market_value\n\n"
+        "Commands: /upload /run /report /weekly on|off /help"
     )
 
 
@@ -171,7 +69,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/upload - instructions\n"
         "/run - run analytics on latest upload\n"
         "/report - get latest report\n"
-        "/weekly on|off - enable/disable Monday summaries\n"
+        "/weekly on|off - enable/disable Monday summaries\n\n"
+        "CSV required columns:\n"
+        "- as_of_date, ticker, quantity, price, market_value\n"
     )
 
 
@@ -200,46 +100,41 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = await tg_file.download_as_bytearray()
     data_bytes = bytes(data)
 
-    # store on disk
+    # Validate schema early
+    try:
+        df = read_csv_bytes(data_bytes)
+        parsed = parse_positions_snapshot(df)
+    except Exception as e:
+        await update.message.reply_text(
+            "❌ CSV schema error.\n"
+            "Your file must be a positions snapshot with required columns:\n"
+            "- as_of_date, ticker, quantity, price, market_value\n\n"
+            f"Error: {e}"
+        )
+        return
+
+    # Store
     user_dir = Path(settings.UPLOAD_DIR) / chat_id
     user_dir.mkdir(parents=True, exist_ok=True)
     stored_path = user_dir / f"{doc.file_unique_id}.csv"
     stored_path.write_bytes(data_bytes)
 
-    # create upload record
     with SessionLocal() as db:
         up = Upload(user_id=user.id, filename=doc.file_name or "upload.csv", stored_path=str(stored_path))
         db.add(up)
         db.commit()
         db.refresh(up)
 
-    # auto-detect columns and save to user
-    df = read_csv_bytes(data_bytes)
-    ticker_col, qty_col, warns = _infer_ticker_and_qty_columns(df)
-
-    with SessionLocal() as db:
-        u = db.query(User).filter(User.telegram_chat_id == chat_id).one()
-        u.ticker_col = ticker_col
-        u.qty_col = qty_col
-        db.commit()
-
     msg_lines = [
         f"✅ Upload saved (id={up.id}).",
-        f"Auto-mapping:",
-        f"- ticker column: {ticker_col or 'NOT FOUND'}",
-        f"- quantity column: {qty_col or 'NOT FOUND'}",
+        f"Holdings detected: {len(parsed.items)}",
     ]
-    if warns:
+    if parsed.as_of_date:
+        msg_lines.append(f"As-of date: {parsed.as_of_date}")
+    if parsed.warnings:
         msg_lines.append("")
         msg_lines.append("⚠️ Notes:")
-        msg_lines.extend([f"- {w}" for w in warns[:10]])
-
-    if not ticker_col or not qty_col:
-        msg_lines.append("")
-        msg_lines.append("❌ I cannot run analytics until both columns are detected.")
-        msg_lines.append("Fix: rename CSV headers to include something like 'symbol' and 'quantity' (or 'shares'), then upload again.")
-        await update.message.reply_text("\n".join(msg_lines))
-        return
+        msg_lines.extend([f"- {w}" for w in parsed.warnings[:10]])
 
     msg_lines.append("")
     msg_lines.append("Run /run to compute analytics.")
@@ -249,14 +144,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = str(update.effective_chat.id)
     user = _get_or_create_user(chat_id)
-
-    # require mapping (auto-saved on upload)
-    if not user.ticker_col or not user.qty_col:
-        await update.message.reply_text(
-            "No saved mapping yet.\n"
-            "Use /upload and send your CSV again (mapping is automatic)."
-        )
-        return
 
     with SessionLocal() as db:
         last_upload = db.query(Upload).filter(Upload.user_id == user.id).order_by(Upload.id.desc()).first()
@@ -268,7 +155,7 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         db.commit()
         db.refresh(job)
 
-    await update.message.reply_text(f"Queued analysis job {job.id}. Use /report in a moment.")
+    await update.message.reply_text(f"Queued analysis job {job.id}. Use /report shortly.")
 
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -287,7 +174,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("No jobs yet. Run /run first.")
         return
 
-    if last_job.status == "queued" or last_job.status == "running":
+    if last_job.status in ("queued", "running"):
         await update.message.reply_text(f"Job {last_job.id} is still {last_job.status}. Try /report again soon.")
         return
 
@@ -303,7 +190,6 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     msg = format_result_message(result)
     await update.message.reply_text(msg)
 
-    # send plots if available
     if last_job.report_paths_json:
         paths = json.loads(last_job.report_paths_json)
         for p in paths:
@@ -348,24 +234,39 @@ def format_result_message(result: dict[str, Any]) -> str:
         return f"{x:.2f}"
 
     lines = []
+    asof = result.get("snapshot_as_of_date")
+    if asof:
+        lines.append(f"🗓 Snapshot as-of: {asof}")
+        lines.append("")
+
     lines.append(f"📊 Trailing window: {w.get('start')} → {w.get('end')} ({w.get('days')} days)")
+    hc = result.get("holdings_count")
+    if hc is not None:
+        lines.append(f"Holdings: {hc}")
     lines.append("")
+
     lines.append("Portfolio:")
     lines.append(f"- Return: {fmt(p.get('return'))}")
     lines.append(f"- Vol (ann.): {fmt(p.get('vol'))}")
     lines.append(f"- Max DD: {fmt(p.get('max_drawdown'))}")
     lines.append(f"- Sharpe (rf=2%): {fmtf(p.get('sharpe'))}")
     lines.append("")
+
     lines.append("Benchmarks:")
     for k, v in bench.items():
         m = v.get("metrics", {})
-        lines.append(f"- {k}: Ret {fmt(m.get('return'))}, Vol {fmt(m.get('vol'))}, MaxDD {fmt(m.get('max_drawdown'))}, Sharpe {fmtf(m.get('sharpe'))}")
+        lines.append(
+            f"- {k}: Ret {fmt(m.get('return'))}, Vol {fmt(m.get('vol'))}, "
+            f"MaxDD {fmt(m.get('max_drawdown'))}, Sharpe {fmtf(m.get('sharpe'))}"
+        )
     lines.append("")
+
     lines.append("TSLA concentration:")
     lines.append(f"- Weight: {fmt(tsla.get('tsla_weight'))}")
     vs = tsla.get("variance_share")
     lines.append(f"- Variance share: {fmt(vs) if vs is not None else 'n/a'}")
     lines.append("")
+
     lines.append("Rebalance (TSLA -25% shares, pro-rata to others):")
     lines.append(f"- Return after: {fmt(after.get('return'))}")
     lines.append(f"- Vol after: {fmt(after.get('vol'))}")
