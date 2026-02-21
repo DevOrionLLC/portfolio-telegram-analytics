@@ -1,11 +1,6 @@
 # Portfolio Telegram Analytics
 
-A **read-only** Python analytics tool that ingests **portfolio snapshot CSV(s)** (positions, not trades), pulls **historical daily prices** from :contentReference[oaicite:0]{index=0} (with free fallback to :contentReference[oaicite:1]{index=1}), computes descriptive metrics, analyzes **TSLA concentration**, runs a **one-time static rebalance simulation**, and delivers results via a :contentReference[oaicite:2]{index=2} bot + weekly summary.
-
-✅ No trading, no forecasting, no brokerage APIs, no ML/AI models  
-✅ Descriptive analytics only + a simple static rebalance simulation  
-✅ Modular, logged, and safe-by-default
-
+This project is a read-only portfolio analytics system that processes uploaded portfolio snapshots and generates descriptive performance reports. It retrieves recent market data using Yahoo Finance with a free Stooq fallback to ensure reliable coverage without paid API dependencies. The system computes key portfolio and benchmark metrics and delivers results with clear visual charts for easier interpretation. The design prioritizes stability, transparency, and ease of use.
 ---
 
 ## What it does (high level)
