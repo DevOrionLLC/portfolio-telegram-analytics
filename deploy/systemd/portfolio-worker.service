@@ -1,0 +1,18 @@
+[Unit]
+Description=Portfolio Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/portfolio-telegram-analytics
+EnvironmentFile=/opt/portfolio-telegram-analytics/.env
+ExecStart=/opt/portfolio-telegram-analytics/scripts/run_worker.sh
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

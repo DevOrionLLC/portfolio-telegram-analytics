@@ -1,0 +1,19 @@
+[Unit]
+Description=Portfolio Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/portfolio-telegram-analytics
+EnvironmentFile=/opt/portfolio-telegram-analytics/.env
+ExecStart=/opt/portfolio-telegram-analytics/scripts/run_bot.sh
+Restart=always
+RestartSec=3
+# optional: safer defaults
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
