@@ -219,7 +219,7 @@ async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         u = db.query(User).filter(User.telegram_chat_id == chat_id).one()
         u.weekly_enabled = enabled
         db.commit()
-    await update.message.reply_text(f"Weekly summary {'enabled' if enabled else 'disabled'}. (Sent Mondays.)")
+    await update.message.reply_text(f"Weekly summary {'enabled' if enabled else 'disabled'}. (Sent Sundays.)")
 
 
 def format_result_message(result: dict[str, Any]) -> str:

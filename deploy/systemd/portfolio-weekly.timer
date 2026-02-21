@@ -1,5 +1,5 @@
 [Unit]
-Description=Run portfolio weekly summaries on Mondays
+Description=Run portfolio weekly summaries on Sundays
 
 [Timer]
 OnCalendar=Sun *-*-* 20:00:00
